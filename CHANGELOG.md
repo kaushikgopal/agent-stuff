@@ -4,6 +4,8 @@ All notable changes to agent-stuff are documented here.
 
 ## Unreleased
 
+* Stabilized unified edit previews by waiting for complete arguments, rejecting stale async results, and making final execution status authoritative.
+
 ## 1.6.0
 
 * Added a redesigned `btw` extension with side chat markdown rendering, tool visibility, deferred session creation, and main-context improvements.

@@ -164,6 +164,7 @@ type RenderContext<TState> = {
 	cwd: string;
 	invalidate: () => void;
 	argsComplete: boolean;
+	isPartial: boolean;
 	isError: boolean;
 	args?: unknown;
 	lastComponent?: Component;
@@ -175,10 +176,10 @@ type UnifiedEditCallRenderComponent = Box & {
 	preview?: Preview;
 	previewArgsKey?: string;
 	previewBuiltFromCompleteArgs?: boolean;
-	previewPending?: boolean;
 	previewPendingArgsKey?: string;
-	previewSuppressedArgsKey?: string;
-	settledError?: boolean;
+	previewGeneration: number;
+	settled: boolean;
+	settledError: boolean;
 };
 
 type UnifiedRenderState = {
@@ -1396,9 +1397,9 @@ function createUnifiedEditCallRenderComponent(): UnifiedEditCallRenderComponent 
 		preview: undefined as Preview | undefined,
 		previewArgsKey: undefined as string | undefined,
 		previewBuiltFromCompleteArgs: false,
-		previewPending: false,
 		previewPendingArgsKey: undefined as string | undefined,
-		previewSuppressedArgsKey: undefined as string | undefined,
+		previewGeneration: 0,
+		settled: false,
 		settledError: false,
 	});
 }
@@ -1419,16 +1420,13 @@ function getUnifiedEditCallRenderComponent(
 }
 
 function getUnifiedEditHeaderBg(
-	preview: Preview | undefined,
-	settledError: boolean | undefined,
+	settled: boolean,
+	settledError: boolean,
 	theme: any,
 ): (text: string) => string {
-	if (preview) {
-		if ("error" in preview) return (text: string) => theme.bg("toolErrorBg", text);
-		return (text: string) => theme.bg("toolSuccessBg", text);
-	}
+	if (!settled) return (text: string) => theme.bg("toolPendingBg", text);
 	if (settledError) return (text: string) => theme.bg("toolErrorBg", text);
-	return (text: string) => theme.bg("toolPendingBg", text);
+	return (text: string) => theme.bg("toolSuccessBg", text);
 }
 
 function setUnifiedEditPreview(
@@ -1451,9 +1449,7 @@ function setUnifiedEditPreview(
 	component.preview = preview;
 	component.previewArgsKey = argsKey;
 	component.previewBuiltFromCompleteArgs = argsComplete;
-	component.previewPending = false;
 	component.previewPendingArgsKey = undefined;
-	component.previewSuppressedArgsKey = undefined;
 	return changed;
 }
 
@@ -1463,30 +1459,27 @@ function requestUnifiedEditPreview(
 	argsKey: string | undefined,
 	cwd: string,
 	argsComplete: boolean,
+	isPartial: boolean,
 	invalidate: () => void,
 ): void {
-	const hasUsablePreview = component.preview && (!argsComplete || component.previewBuiltFromCompleteArgs);
+	if (!argsComplete || !isPartial || component.settled) return;
+	const hasUsablePreview = component.preview && component.previewBuiltFromCompleteArgs;
 	if (!text || !argsKey || hasUsablePreview || component.previewPendingArgsKey === argsKey) return;
-	if (!argsComplete && component.previewSuppressedArgsKey === argsKey) return;
 
-	component.previewPending = true;
 	component.previewPendingArgsKey = argsKey;
 	const requestKey = argsKey;
-	void buildPreviewPlan(text, cwd, argsComplete)
+	const requestGeneration = ++component.previewGeneration;
+	void buildPreviewPlan(text, cwd, true)
 		.then((plan): Preview => previewForPlan(plan))
-		.catch((err): Preview | undefined => {
-			if (!argsComplete) return undefined;
-			return { error: err instanceof Error ? err.message : String(err) };
-		})
+		.catch((err): Preview => ({ error: err instanceof Error ? err.message : String(err) }))
 		.then((preview) => {
-			if (component.previewArgsKey !== requestKey) return;
-			component.previewPending = false;
-			component.previewPendingArgsKey = undefined;
-			if (preview) {
-				setUnifiedEditPreview(component, preview, requestKey, argsComplete);
-			} else {
-				component.previewSuppressedArgsKey = requestKey;
-			}
+			if (
+				component.previewArgsKey !== requestKey ||
+				component.previewGeneration !== requestGeneration ||
+				component.settled
+			)
+				return;
+			setUnifiedEditPreview(component, preview, requestKey, true);
 			invalidate();
 		});
 }
@@ -1497,7 +1490,7 @@ function buildUnifiedEditCallComponent(
 	theme: any,
 	cwd: string,
 ): UnifiedEditCallRenderComponent {
-	component.setBgFn(getUnifiedEditHeaderBg(component.preview, component.settledError, theme));
+	component.setBgFn(getUnifiedEditHeaderBg(component.settled, component.settledError, theme));
 	component.clear();
 	component.addChild(new Text(formatUnifiedEditCall(text, component.preview, theme, cwd), 0, 0));
 
@@ -1558,16 +1551,24 @@ export default function unifiedEditExtension(pi: ExtensionAPI) {
 			const text = prepared && typeof prepared.text === "string" ? prepared.text : undefined;
 			const key = text === undefined ? undefined : `${context.cwd}\0${text}`;
 			if (component.previewArgsKey !== key) {
+				component.previewGeneration++;
 				component.preview = undefined;
 				component.previewArgsKey = key;
 				component.previewBuiltFromCompleteArgs = false;
-				component.previewPending = false;
 				component.previewPendingArgsKey = undefined;
-				component.previewSuppressedArgsKey = undefined;
+				component.settled = false;
 				component.settledError = false;
 			}
 
-			requestUnifiedEditPreview(component, text, key, context.cwd, context.argsComplete, () => context.invalidate());
+			requestUnifiedEditPreview(
+				component,
+				text,
+				key,
+				context.cwd,
+				context.argsComplete,
+				context.isPartial,
+				() => context.invalidate(),
+			);
 
 			return buildUnifiedEditCallComponent(component, text, theme, context.cwd);
 		},
@@ -1580,8 +1581,20 @@ export default function unifiedEditExtension(pi: ExtensionAPI) {
 			const key = text === undefined ? undefined : `${context.cwd}\0${text}`;
 			let changed = false;
 
-			if (component) {
-				if (!context.isError && typed.details?.diff) {
+			if (component && !context.isPartial) {
+				component.previewGeneration++;
+				component.previewPendingArgsKey = undefined;
+				if (!component.settled) {
+					component.settled = true;
+					changed = true;
+				}
+				if (context.isError) {
+					if (component.preview !== undefined) {
+						component.preview = undefined;
+						component.previewBuiltFromCompleteArgs = false;
+						changed = true;
+					}
+				} else if (typed.details?.diff) {
 					changed =
 						setUnifiedEditPreview(
 							component,
